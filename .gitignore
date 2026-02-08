@@ -1,0 +1,14 @@
+# Rust artifacts
+target/
+**/*.rs.bk
+
+# IDEs
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+
+# Logs
+*.log
