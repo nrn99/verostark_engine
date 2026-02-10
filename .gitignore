@@ -11,4 +11,8 @@ target/
 .DS_Store
 
 # Logs
+# Logs
 *.log
+
+# Heavy Models
+model/

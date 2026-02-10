@@ -13,6 +13,9 @@ use serde_json::json;
 mod scrubber;
 use scrubber::SwedishScrubber;
 
+mod cortex;
+use cortex::SmartScrubber;
+
 // --- CONFIGURATION ---
 static ALLOWED_IPS: Lazy<HashSet<String>> = Lazy::new(|| {
     let mut s = HashSet::new();
@@ -37,6 +40,7 @@ pub struct VerostarkContext {
 struct VerostarkProxy {
     lua_brain: Arc<std::sync::Mutex<Lua>>,
     scrubber: Arc<SwedishScrubber>,
+    cortex: Arc<SmartScrubber>,
 }
 
 impl VerostarkProxy {
@@ -44,9 +48,18 @@ impl VerostarkProxy {
         let lua = Lua::new();
         lua.load(lua_script).exec().expect("CRITICAL: Failed to load Lua Guard.");
         
+        info!("Initializing Cortex (SmartScrubber)...");
+        // Paths relative to the working directory (Docker WORKDIR /app)
+        let cortex = SmartScrubber::new(
+            "model/model.safetensors",
+            "model/tokenizer.json",
+            "model/config.json"
+        ).expect("CRITICAL: Failed to load Cortex AI Model.");
+
         VerostarkProxy {
             lua_brain: Arc::new(std::sync::Mutex::new(lua)),
             scrubber: Arc::new(SwedishScrubber::new()),
+            cortex: Arc::new(cortex),
         }
     }
 
@@ -178,13 +191,22 @@ impl ProxyHttp for VerostarkProxy {
             // In a real high-perf scenario, we'd enable the zero-copy optimization 
             // or stream processing without full utf8 validation if possible.
             if let Ok(text) = std::str::from_utf8(b) {
-                // Perform Scrubbing
-                let (scrubbed_text, count) = self.scrubber.scrub(text);
+                // 1. Reflex: Regex Scrubbing (Fast)
+                let (regex_scrubbed, regex_count) = self.scrubber.scrub(text);
                 
-                if count > 0 {
-                    ctx.scrub_count += count; // Accumulate count across chunks
+                // 2. Cortex: AI Scrubbing (Smart)
+                // We pass the already-regex-scrubbed text to the model to catch what Regex missed.
+                let (final_text, smart_count) = self.cortex.scrub(&regex_scrubbed);
+                
+                let total_count = regex_count + smart_count;
+
+                if total_count > 0 {
+                    if smart_count > 0 {
+                         info!("[CORTEX] Smart Scrubber detected {} context-sensitive entities.", smart_count);
+                    }
+                    ctx.scrub_count += total_count; // Accumulate count across chunks
                     // Replace the body chunk with the scrubbed version
-                    *body = Some(Bytes::from(scrubbed_text));
+                    *body = Some(Bytes::from(final_text));
                 }
             }
         }
