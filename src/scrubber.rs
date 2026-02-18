@@ -1,4 +1,12 @@
 use regex::{Regex, RegexSet};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct ScrubResult {
+    pub text: String,
+    pub total: usize,
+    pub details: HashMap<String, usize>,
+}
 
 pub struct SwedishScrubber {
     regex_set: RegexSet,
@@ -43,10 +51,15 @@ impl SwedishScrubber {
         }
     }
 
-    pub fn scrub(&self, text: &str) -> (String, usize) {
+    pub fn scrub(&self, text: &str) -> ScrubResult {
+        let mut details = HashMap::new();
         // Optimization: Use RegexSet to check if any pattern matches before iterating
         if !self.regex_set.is_match(text) {
-            return (text.to_string(), 0);
+            return ScrubResult {
+                text: text.to_string(),
+                total: 0,
+                details,
+            };
         }
 
         let mut result = text.to_string();
@@ -69,11 +82,23 @@ impl SwedishScrubber {
                     result = pattern
                         .replace_all(&result, self.replacements[i])
                         .to_string();
+                    
+                    // Add to details
+                    // replacements[i] contains <SE_PERSONNUMMER>, we map that or use pattern name logic?
+                    // We can just use the replacement string as key for simplicity.
+                    // Or keep a separate label? Let's use replacement string stripped of <> maybe?
+                    // No, keeping <TAG> is fine for JSON.
+                    let key = self.replacements[i].to_string();
+                    *details.entry(key).or_insert(0) += count;
                 }
             }
         }
 
-        (result, total_replacements)
+        ScrubResult {
+            text: result,
+            total: total_replacements,
+            details,
+        }
     }
 }
 
@@ -86,9 +111,10 @@ mod tests {
         let scrubber = SwedishScrubber::new();
         let input = "My ID is 19900101-1234.";
         let expected = "My ID is <SE_PERSONNUMMER>.";
-        let (res, count) = scrubber.scrub(input);
-        assert_eq!(res, expected);
-        assert_eq!(count, 1);
+        let res = scrubber.scrub(input);
+        assert_eq!(res.text, expected);
+        assert_eq!(res.total, 1);
+        assert_eq!(res.details.get("<SE_PERSONNUMMER>"), Some(&1));
     }
 
     #[test]
@@ -96,9 +122,9 @@ mod tests {
         let scrubber = SwedishScrubber::new();
         let input = "Pay to 123-4567 please.";
         let expected = "Pay to <SE_BANKGIRO> please.";
-        let (res, count) = scrubber.scrub(input);
-        assert_eq!(res, expected);
-        assert_eq!(count, 1);
+        let res = scrubber.scrub(input);
+        assert_eq!(res.text, expected);
+        assert_eq!(res.total, 1);
     }
 
     #[test]
@@ -106,9 +132,9 @@ mod tests {
         let scrubber = SwedishScrubber::new();
         let input = "Car ABC 123 parked here.";
         let expected = "Car <SE_CAR_PLATE> parked here.";
-        let (res, count) = scrubber.scrub(input);
-        assert_eq!(res, expected);
-        assert_eq!(count, 1);
+        let res = scrubber.scrub(input);
+        assert_eq!(res.text, expected);
+        assert_eq!(res.total, 1);
     }
 
     #[test]
@@ -116,9 +142,9 @@ mod tests {
         let scrubber = SwedishScrubber::new();
         let input = "Call me at 070-123 45 67.";
         let expected = "Call me at <SE_MOBILE>.";
-        let (res, count) = scrubber.scrub(input);
-        assert_eq!(res, expected);
-        assert_eq!(count, 1);
+        let res = scrubber.scrub(input);
+        assert_eq!(res.text, expected);
+        assert_eq!(res.total, 1);
     }
 
     #[test]
@@ -126,9 +152,9 @@ mod tests {
         let scrubber = SwedishScrubber::new();
         let input = "Card: 1234 5678 1234 5678.";
         let expected = "Card: <CREDIT_CARD>.";
-        let (res, count) = scrubber.scrub(input);
-        assert_eq!(res, expected);
-        assert_eq!(count, 1);
+        let res = scrubber.scrub(input);
+        assert_eq!(res.text, expected);
+        assert_eq!(res.total, 1);
     }
     
     #[test]
@@ -136,8 +162,8 @@ mod tests {
         let scrubber = SwedishScrubber::new();
         let input = "Just some normal text with number 12345.";
         let expected = "Just some normal text with number 12345.";
-        let (res, count) = scrubber.scrub(input);
-        assert_eq!(res, expected);
-        assert_eq!(count, 0);
+        let res = scrubber.scrub(input);
+        assert_eq!(res.text, expected);
+        assert_eq!(res.total, 0);
     }
 }

@@ -3,6 +3,10 @@ use candle_nn::{VarBuilder, Module, Linear, linear};
 use candle_transformers::models::bert::{BertModel, Config};
 use tokenizers::Tokenizer;
 use std::path::Path;
+use std::collections::HashMap;
+
+use crate::scrubber::ScrubResult;
+
 
 use log::{info, error};
 
@@ -70,9 +74,13 @@ impl SmartScrubber {
         })
     }
 
-    pub fn scrub(&self, text: &str) -> (String, usize) {
+    pub fn scrub(&self, text: &str) -> ScrubResult {
         if text.trim().is_empty() {
-            return (text.to_string(), 0);
+            return ScrubResult {
+                text: text.to_string(),
+                total: 0,
+                details: HashMap::new(),
+            };
         }
 
         // Physics Hack: Phantom Context
@@ -88,7 +96,7 @@ impl SmartScrubber {
             text.to_string()
         };
 
-        let (scrubbed, count) = self.scrub_internal(&process_text);
+        let result = self.scrub_internal(&process_text);
 
         if use_phantom {
             // Unwrap: "Hello, regarding [SCRUBBED] today."
@@ -96,20 +104,34 @@ impl SmartScrubber {
             // Suffix len: " today.".len() = 7
             let prefix_len = 17;
             let suffix_len = 7;
-            if scrubbed.len() > prefix_len + suffix_len {
-                let real_scrubbed = &scrubbed[prefix_len..scrubbed.len()-suffix_len];
-                return (real_scrubbed.to_string(), count);
+            if result.text.len() > prefix_len + suffix_len {
+                let real_scrubbed = &result.text[prefix_len..result.text.len()-suffix_len];
+                return ScrubResult {
+                    text: real_scrubbed.to_string(),
+                    total: result.total,
+                    details: result.details,
+                };
             }
             // Fallback if length mismatch (shouldn't happen unless aggressive scrubbing changed structure)
-            return (text.to_string(), 0); 
+            return ScrubResult {
+                text: text.to_string(),
+                total: 0,
+                details: HashMap::new(),
+            };
         }
 
-        (scrubbed, count)
+        result
     }
 
-    fn scrub_internal(&self, text: &str) -> (String, usize) {
+    fn scrub_internal(&self, text: &str) -> ScrubResult {
+         let mut empty_res = ScrubResult {
+            text: text.to_string(),
+            total: 0,
+            details: HashMap::new(),
+        };
+
         if text.trim().is_empty() {
-            return (text.to_string(), 0);
+            return empty_res;
         }
 
         // Tokenize
@@ -118,7 +140,7 @@ impl SmartScrubber {
             Ok(e) => e,
             Err(e) => {
                 error!("Tokenizer failed: {}", e);
-                return (text.to_string(), 0);
+                return empty_res;
             }
         };
 
@@ -127,17 +149,17 @@ impl SmartScrubber {
         // Inference
         let input_ids = match Tensor::new(token_ids, &self.device).and_then(|t| t.unsqueeze(0)) {
             Ok(t) => t,
-            Err(_) => return (text.to_string(), 0),
+            Err(_) => return empty_res,
         };
         
         let token_type_ids = match input_ids.zeros_like() {
             Ok(t) => t,
-            Err(_) => return (text.to_string(), 0),
+            Err(_) => return empty_res,
         };
 
         let output = match self.model.forward(&input_ids, &token_type_ids, None) {
             Ok(o) => o,
-            Err(_) => return (text.to_string(), 0),
+            Err(_) => return empty_res,
         };
 
         // Get logits (batch, seq_len, num_labels)
@@ -146,6 +168,7 @@ impl SmartScrubber {
         // Simple Argmax decoding
         let mut new_text = String::new();
         let mut scrub_count = 0;
+        let mut details = HashMap::new();
         
         // Reconstruct string logic is complex with subwords. 
         // For MVP, if we detect entities, we can just replace the whole text or try to map back to spans.
@@ -207,7 +230,7 @@ impl SmartScrubber {
         // Reconstruction loop could be simpler:
         // Use the original text and offsets to build a new string.
         if mask_spans.is_empty() {
-            return (text.to_string(), 0);
+             return empty_res;
         }
 
         // Apply replacements (reverse order to keep indices valid? Or build from left to right)
@@ -222,11 +245,18 @@ impl SmartScrubber {
                 new_text.push_str(label);
                 last_pos = end;
                 scrub_count += 1;
+                
+                // Track details
+                *details.entry(label.to_string()).or_insert(0) += 1;
             }
         }
         new_text.push_str(&text[last_pos..]);
 
-        (new_text, scrub_count)
+        ScrubResult {
+            text: new_text,
+            total: scrub_count,
+            details,
+        }
     }
 }
 
@@ -250,16 +280,16 @@ mod tests {
 
         // Test Case 1: Person Name
         let input = "My name is John Smith.";
-        let (scrubbed, count) = scrubber.scrub(input);
-        println!("Input: {}, Scrubbed: {}", input, scrubbed);
-        assert!(count >= 1);
-        assert!(scrubbed.contains("<PERSON>"));
+        let res = scrubber.scrub(input);
+        println!("Input: {}, Scrubbed: {}", input, res.text);
+        assert!(res.total >= 1);
+        assert!(res.text.contains("<PERSON>"));
 
         // Test Case 2: Location
         let input = "I live in Paris.";
-        let (scrubbed, count) = scrubber.scrub(input);
-        println!("Input: {}, Scrubbed: {}", input, scrubbed);
-        assert!(count >= 1);
-        assert!(scrubbed.contains("<LOCATION>"));
+        let res = scrubber.scrub(input);
+        println!("Input: {}, Scrubbed: {}", input, res.text);
+        assert!(res.total >= 1);
+        assert!(res.text.contains("<LOCATION>"));
     }
 }

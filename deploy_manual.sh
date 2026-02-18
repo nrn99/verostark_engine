@@ -18,11 +18,19 @@ if ! docker login rg.${REGION}.scw.cloud > /dev/null 2>&1; then
     read -p "Press Enter when logged in..."
 fi
 
-echo "📦 Tagging image..."
-docker tag ${IMAGE_NAME} ${REMOTE_TAG}
+echo "🔨 Building for Cloud (linux/amd64)..."
+# CRITICAL: Force x86_64 build for Cloud compatibility
+docker build --platform linux/amd64 -t ${REMOTE_TAG} .
 
 echo "⬆️  Pushing image to ${REMOTE_TAG}..."
 docker push ${REMOTE_TAG}
 
 echo "✅ Deployment Push Complete!"
-echo "Next Step: Go to Scaleway Console -> Serverless Containers -> Redeploy"
+echo "Next Step: You MUST set these secrets in Scaleway Console:"
+echo "  - LOKI_URL"
+echo "  - LOKI_USER"
+echo "  - LOKI_KEY"
+echo ""
+echo "Then REDEPLOY the Container."
+echo "Logs will appear in Grafana Cloud (Explore -> job='verostark')."
+echo "Done."

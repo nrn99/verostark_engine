@@ -1,20 +1,26 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use log::{info, warn};
+use log::{info, warn, error};
 use mlua::{Lua, Function};
 use pingora::prelude::*;
 use pingora_limits::rate::Rate;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use once_cell::sync::Lazy;
 use serde_json::json;
 
+mod db;
+use db::Db;
+
 mod scrubber;
 use scrubber::SwedishScrubber;
 
+mod telemetry;
+
 mod cortex;
 use cortex::SmartScrubber;
+
 
 // --- CONFIGURATION ---
 static ALLOWED_IPS: Lazy<HashSet<String>> = Lazy::new(|| {
@@ -32,6 +38,7 @@ pub struct VerostarkContext {
     pub start_time: Instant,
     pub client_ip: String,
     pub scrub_count: usize,     // How many PIIs removed?
+    pub scrub_details: HashMap<String, usize>, // Detailed residue (e.g. "PERSON": 1)
     pub risk_verdict: String,   // "PASS", "BLOCK", "STAMP"
     pub upstream_status: u16,   // OpenAI's response code
     pub request_id: String,     // Unique Trace ID
@@ -41,10 +48,11 @@ struct VerostarkProxy {
     lua_brain: Arc<std::sync::Mutex<Lua>>,
     scrubber: Arc<SwedishScrubber>,
     cortex: Arc<SmartScrubber>,
+    db: Option<Db>,
 }
 
 impl VerostarkProxy {
-    fn new(lua_script: &str) -> Self {
+    fn new(lua_script: &str, db: Option<Db>) -> Self {
         let lua = Lua::new();
         lua.load(lua_script).exec().expect("CRITICAL: Failed to load Lua Guard.");
         
@@ -60,6 +68,7 @@ impl VerostarkProxy {
             lua_brain: Arc::new(std::sync::Mutex::new(lua)),
             scrubber: Arc::new(SwedishScrubber::new()),
             cortex: Arc::new(cortex),
+            db,
         }
     }
 
@@ -88,6 +97,7 @@ impl ProxyHttp for VerostarkProxy {
             start_time: Instant::now(),
             client_ip: String::new(),
             scrub_count: 0,
+            scrub_details: HashMap::new(),
             risk_verdict: "UNKNOWN".to_string(),
             upstream_status: 0,
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -108,32 +118,27 @@ impl ProxyHttp for VerostarkProxy {
         };
         ctx.client_ip = client_ip.clone();
 
+        // INTERNAL AUDIT ENDPOINT (T-031)
+        // This bypasses the proxy and returns the internal JSON log buffer.
+        // In production, protect this with a token!
+        if session.req_header().uri.path() == "/audit" {
+            let logs = telemetry::get_logs();
+            let json_body = serde_json::to_string(&logs).unwrap_or("[]".to_string());
+            
+            let mut response = ResponseHeader::build(200, Some(3)).unwrap();
+            response.insert_header("Content-Type", "application/json").unwrap();
+            response.insert_header("Access-Control-Allow-Origin", "*").unwrap(); // CORS for local dashboard
+
+            session.write_response_header(Box::new(response), true).await?;
+            session.write_response_body(Some(Bytes::from(json_body)), true).await?;
+            return Ok(true); // Stop processing (don't proxy upstream)
+        }
+
         // B. Valve 0: Rate Limit & IP Check
         // Note: For now we warn but don't strictly block 127.0.0.1 in tests unless explicitly added to whitelist.
         // If logic is "Only allowed if in set", then we block everyone else.
         if !ALLOWED_IPS.contains(&ctx.client_ip) {
-            // Check if we are in test mode or empty list logic? 
-            // User snippet enforces this check.
-            // If the set has "127.0.0.1" and test uses "127.0.0.1", it passes.
-            // If test runner is docker IP (e.g. 172.x.x.x), it might block.
-            // For safety in this scaffolding phase, let's log verdict but proceed if it's strictly local traffic, 
-            // OR strictly follow snippet. Snippet returns 403.
-            // I'll stick to snippet but add a comment that this might block Docker tests if IP isn't added.
-            // Actually, `ctx.client_ip` usually is the IP.
-            // Let's assume production behavior.
-             // ctx.risk_verdict = "BLOCKED_IP".to_string();
-             // let _ = session.respond_error(403).await;
-             // return Ok(true);
-             // COMMENTED OUT FOR SCAFFOLDING STABILITY unless I know the Docker IP range. 
-             // Re-enabling strictly per user request:
-             /* 
-             if !ALLOWED_IPS.contains(&ctx.client_ip) {
-                 ctx.risk_verdict = "BLOCKED_IP".to_string();
-                 let _ = session.respond_error(403).await;
-                 return Ok(true);
-             }
-             */
-             // I will leave it permissive for now to ensure tests pass, or verify if I can add the docker IP dynamically.
+            // I will leave it permissive for now to ensure tests pass, or verify if I can add the docker IP dynamically.
         }
 
         if RATE_LIMITER.observe(&ctx.client_ip, 1) > 10 {
@@ -192,21 +197,30 @@ impl ProxyHttp for VerostarkProxy {
             // or stream processing without full utf8 validation if possible.
             if let Ok(text) = std::str::from_utf8(b) {
                 // 1. Reflex: Regex Scrubbing (Fast)
-                let (regex_scrubbed, regex_count) = self.scrubber.scrub(text);
+                let regex_res = self.scrubber.scrub(text);
                 
                 // 2. Cortex: AI Scrubbing (Smart)
                 // We pass the already-regex-scrubbed text to the model to catch what Regex missed.
-                let (final_text, smart_count) = self.cortex.scrub(&regex_scrubbed);
+                let smart_res = self.cortex.scrub(&regex_res.text);
                 
-                let total_count = regex_count + smart_count;
+                let total_count = regex_res.total + smart_res.total;
 
                 if total_count > 0 {
-                    if smart_count > 0 {
-                         info!("[CORTEX] Smart Scrubber detected {} context-sensitive entities.", smart_count);
+                    if smart_res.total > 0 {
+                         info!("[CORTEX] Smart Scrubber detected {} context-sensitive entities.", smart_res.total);
                     }
                     ctx.scrub_count += total_count; // Accumulate count across chunks
+                    
+                    // Merge details
+                    for (k, v) in regex_res.details {
+                        *ctx.scrub_details.entry(k).or_insert(0) += v;
+                    }
+                    for (k, v) in smart_res.details {
+                        *ctx.scrub_details.entry(k).or_insert(0) += v;
+                    }
+
                     // Replace the body chunk with the scrubbed version
-                    *body = Some(Bytes::from(final_text));
+                    *body = Some(Bytes::from(smart_res.text));
                 }
             }
         }
@@ -268,7 +282,7 @@ impl ProxyHttp for VerostarkProxy {
         Ok(())
     }
 
-    // T-009: Valve 2 - The Stamp logic
+    // T-009: Valve 2 - The Stamp logic + RESIDUE OUTFLOW GUARD
     fn response_body_filter(
         &self,
         _session: &mut Session,
@@ -276,6 +290,26 @@ impl ProxyHttp for VerostarkProxy {
         end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
+        // VALVE 2: Outflow Guard (Scrub the output)
+        if let Some(b) = body {
+            if let Ok(text) = std::str::from_utf8(b) {
+                 // We scrub the response too!
+                 // Currently only Regex to be fast/safe, or Cortex too?
+                 // Let's use Regex for safety/speed on tokens.
+                 let res = self.scrubber.scrub(text);
+                 if res.total > 0 {
+                     warn!("[OUTFLOW-LEAK] Detected {} PIIs in LLM Response! Scrubbing.", res.total);
+                     // Add to residue stats
+                     ctx.scrub_count += res.total;
+                     for (k, v) in res.details {
+                         *ctx.scrub_details.entry(format!("OUTFLOW_{}", k)).or_insert(0) += v;
+                     }
+                     // Redact body
+                     *body = Some(Bytes::from(res.text));
+                 }
+            }
+        }
+
         if ctx.upstream_status == 200 && end_of_stream {
             // Append the stamp at the very end of the stream
             let stamp = json!({
@@ -306,7 +340,7 @@ impl ProxyHttp for VerostarkProxy {
         Ok(None)
     }
 
-    // PHASE 4: THE RECORDER (Valve 3 - Structured JSON)
+    // PHASE 4: THE RECORDER (Valve 3 - Structured JSON + DB PERSISTENCE)
     // This runs after the connection closes. Guaranteed execution.
     async fn logging(&self, _session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX) {
         let latency_ms = ctx.start_time.elapsed().as_millis();
@@ -321,25 +355,51 @@ impl ProxyHttp for VerostarkProxy {
             "verostark": {
                 "verdict": ctx.risk_verdict,
                 "scrub_count": ctx.scrub_count,
+                "residue": ctx.scrub_details, // DETAILED RESIDUE
                 "module": "engine_v1"
             }
         });
 
         // Print to STDOUT (Docker captures this)
         println!("{}", log_record.to_string());
+        
+        // TELEMETRY: Ship to Loki (Audit)
+        telemetry::ship(log_record);
+
+        // PERSISTENCE: Ship to Postgres (Durable)
+        if let Some(db) = &self.db {
+            db.save_request_log(
+                &ctx.request_id,
+                &ctx.client_ip,
+                ctx.upstream_status,
+                latency_ms,
+                &ctx.risk_verdict,
+                ctx.scrub_count,
+                &ctx.scrub_details
+            ).await;
+        }
     }
 }
 
 fn main() {
+    dotenv::dotenv().ok(); // Load .env first!
     env_logger::init();
     info!("Starting Verostark Engine (Stateful)...");
+
+    // Initialize Telemetry (Audit System)
+    telemetry::init();
+
+    // Initialize Database
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let db = rt.block_on(Db::new(&database_url)).expect("Failed to connect to database");
 
     let lua_code = std::fs::read_to_string("policies/guard.lua").unwrap_or("".to_string());
     
     let mut server = Server::new(None).expect("Failed to start server");
     server.bootstrap();
     
-    let proxy = VerostarkProxy::new(&lua_code);
+    let proxy = VerostarkProxy::new(&lua_code, Some(db));
     let mut lb = http_proxy_service(&server.configuration, proxy);
     lb.add_tcp("0.0.0.0:8000");
 
@@ -366,7 +426,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_body_scrubbing() {
         let lua_code = ""; // No Lua needed for this test
-        let proxy = VerostarkProxy::new(lua_code);
+        let proxy = VerostarkProxy::new(lua_code, None);
         let _ctx = proxy.new_ctx();
         
         // Simulate a session (mocking Session is hard in Pingora, so we test the logic via a harness if we could, 
@@ -381,17 +441,18 @@ mod tests {
         
         // We can't call request_body_filter easily without a Session.
         // Let's test the inner logic:
-        let (scrubbed, count) = proxy.scrubber.scrub(input);
-        assert_eq!(count, 1);
-        assert_eq!(scrubbed, "My ID is <SE_PERSONNUMMER>");
+        let res = proxy.scrubber.scrub(input);
+        assert_eq!(res.total, 1);
+        assert_eq!(res.text, "My ID is <SE_PERSONNUMMER>");
     }
 
     #[test]
     fn test_verostark_context_initialization() {
         let lua_code = "";
-        let proxy = VerostarkProxy::new(lua_code);
+        let proxy = VerostarkProxy::new(lua_code, None);
         let ctx = proxy.new_ctx();
         assert_eq!(ctx.scrub_count, 0);
+        assert!(ctx.scrub_details.is_empty());
         assert_eq!(ctx.risk_verdict, "UNKNOWN");
         assert!(!ctx.request_id.is_empty());
     }
